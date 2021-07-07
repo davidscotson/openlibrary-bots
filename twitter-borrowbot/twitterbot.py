@@ -2,19 +2,26 @@
 import os
 import time
 import tweepy
+import logging
+import twitterbotErrors
 from dotenv import load_dotenv
-
-from services import InternetArchive, ISBNFinder, Logger
+from services import InternetArchive, ISBNFinder
 
 ACTIONS = ('read', 'borrow', 'preview')
 READ_OPTIONS = dict(zip(InternetArchive.MODES, ACTIONS))
 BOT_NAME = "@borrowbot"
 STATE_FILE = 'last_seen_id.txt'
 
-LOGGER = Logger("./logs/tweet_logs.txt", "./logs/error_logs.txt")
+LOG_FILE = "twitterbot.log"
+
+API = None
+MENTION_LIMIT = 100
+LAST_SEEN_ID_LEN = 19
 
 load_dotenv()
-
+if not os.environ.get('CONSUMER_KEY') or not os.environ.get('CONSUMER_SECRET') or not os.environ.get('ACCESS_TOKEN') or not os.environ.get('ACCESS_TOKEN_SECRET'):
+    raise twitterbotErrors.TweepyAuthenticationError(error="Missing .env file or missing necessary keys for authentication")
+    
 # Authenticate
 auth = tweepy.OAuthHandler(
     os.environ.get('CONSUMER_KEY'),
@@ -24,21 +31,26 @@ auth.set_access_token(
     os.environ.get('ACCESS_TOKEN'),
     os.environ.get('ACCESS_TOKEN_SECRET')
 )
-api = tweepy.API(auth, wait_on_rate_limit=True)
+API = tweepy.API(auth, wait_on_rate_limit=True)
 
 class Tweet:
+
     @staticmethod
     def _tweet(mention, message, debug=False):
+        if not mention.user.screen_name or not mention.id:
+            raise twitterbotErrors.SendTweetError(mention=mention, error="Given mention is missing either a screen name or a status ID")
         msg = "Hi 👋 @%s %s" % (mention.user.screen_name, message)
-        if not debug:
-            api.update_status(
-                msg,
-                in_reply_to_status_id=mention.id,
-                auto_populate_reply_metadata=True
-            )
+        if not debug:               
+            try:
+                API.update_status(
+                    msg,
+                    in_reply_to_status_id=mention.id,
+                    auto_populate_reply_metadata=True
+                )
+            except Exception as e:
+                raise twitterbotErrors.SendTweetError(mention=mention, message=msg, error=e)
         else:
-            print(msg)
-        LOGGER.log_tweet(msg)
+            logging.info("RESPONSE: " + msg.replace("\n", " "))
 
     @classmethod
     def edition_available(cls, mention, edition):
@@ -90,39 +102,70 @@ class Tweet:
             "\nAn ISBN, Amazon or Goodreads url are required."
         )
 
-def get_last_seen_id():
-    with open(STATE_FILE, 'r') as fin:
-        return int(fin.read().strip())
 
+def get_last_seen_id():
+    try:
+        with open(STATE_FILE, 'r') as fin:
+            last_seen_id = fin.read().strip()
+    except Exception as e:
+        raise twitterbotErrors.FileIOError(filename=STATE_FILE, error=e)
+    else:
+        if len(last_seen_id) < LAST_SEEN_ID_LEN or not last_seen_id.isdecimal():
+            raise twitterbotErrors.LastSeenIDError(filename=STATE_FILE, last_seen_id=last_seen_id)
+        return int(last_seen_id)
+        
 
 def set_last_seen_id(mention):
-    with open(STATE_FILE, 'w') as fout:
-        fout.write(str(mention.id))
+    try:
+        with open(STATE_FILE, 'w') as fout:
+            fout.write(str(mention.id))
+    except Exception as e:
+        raise twitterbotErrors.FileIOError(filename=STATE_FILE, data=mention.id, error=e)
+
 
 def get_parent_tweet_of(mention):
-    return api.get_status(
-        mention.in_reply_to_status_id,
-        tweet_mode="extended")
+    try:
+        return API.get_status(
+            mention.in_reply_to_status_id,
+            tweet_mode="extended")
+    except Exception as e:
+        raise twitterbotErrors.GetTweetError(tweet_id=mention.in_reply_to_status_id, error=e)
 
 
 def get_latest_mentions(since=None):
-    since = since or get_last_seen_id()
     try:
-        return api.mentions_timeline(since, tweet_mode="extended")
+        since = since or get_last_seen_id()
+        mentions = API.mentions_timeline(since, tweet_mode="extended")
+        if len(mentions) >= MENTION_LIMIT:
+            raise twitterbotErrors.TooManyMentionsError(since=since, mention_count=len(mentions), mention_limit=MENTION_LIMIT)
+        return mentions
+    except twitterbotErrors.TooManyMentionsError as e:
+        logging.warning(e)
+        return mentions[MENTION_LIMIT:] # MIGHT BE mentions[MENTION_LIMIT:] FIFO vs LIFO
     except Exception as e:
-        print("Exception: %s" % e)
-        return None
+        raise twitterbotErrors.GetMentionsError(since=since, error=e)
+
 
 def is_reply_to_me(mention):
-    return mention.in_reply_to_status_id is api.me().id
+    return mention.in_reply_to_status_id is API.me().id
 
 def handle_isbn(mention, isbn):
-    edition = InternetArchive.get_edition(isbn)
+    try:
+        edition = InternetArchive.get_edition(isbn)
+    except (twitterbotErrors.GetEditionError, twitterbotErrors.GetAvailabilityError) as e:
+        logging.critical(e)
+        return Tweet.internal_error(mention)
+        
     if edition:
         if edition.get("availability"):
             return Tweet.edition_available(mention, edition)
 
-        work = InternetArchive.find_available_work(edition)
+        try:
+            work = InternetArchive.find_available_work(edition)
+        except twitterbotErrors.FindAvailableWorkError as e:
+            logging.critical(e)
+            return Tweet.internal_error(mention)
+
         if work:
             return Tweet.work_available(mention, work)
         return Tweet.edition_unavailable(mention, edition)
@@ -130,49 +173,58 @@ def handle_isbn(mention, isbn):
 def reply_to_tweets():
     try:
         mentions = get_latest_mentions()
-    except Exception as err:
-        LOGGER.log_error("Failed to get mentions: %s" % err)
+    except twitterbotErrors.GetMentionsError as e:
+        logging.critical(e)
         return
-    
+
     for mention in reversed(mentions):
-        print(str(mention.id) + ': ' + mention.full_text)
+        logging.info("MENTION FROM: " + mention.user.screen_name + " | ID: " + str(mention.id) + " --> " + mention.full_text.replace("\n", " "))
 
         try:
             set_last_seen_id(mention)
-        except Exception as err:
-            LOGGER.log_error("Failed to set last seen id: %s" % err)
-            continue 
+        except twitterbotErrors.FileIOError as e:
+            logging.critical(e)
+            return
         
-        # I think I can remove this line. get_latest_mentions should handle
-        if BOT_NAME in mention.full_text:
+        try:
+            isbns = ISBNFinder.find_isbns(mention.full_text)
+        except twitterbotErrors.FindISBNError as e:
+            logging.warning(e)
+            continue
+        
+        # no isbn found in tweet. Check the parent tweet
+        if not isbns and mention.in_reply_to_status_id:
             try:
-                isbns = ISBNFinder.find_isbns(mention.full_text)
-                # no isbn found in tweet. Check the parent tweet
-                if not isbns and mention.in_reply_to_status_id:
-                    parent_mention = get_parent_tweet_of(mention)
-                    isbns = ISBNFinder.find_isbns(parent_mention.full_text)
-                    # Reply to me
-                    if not isbns and parent_mention.user.id == api.me().id:
-                        print("is reply to me")
-                        continue
-                if isbns:
-                    for isbn in isbns:
-                        handle_isbn(mention, isbn)
-                    continue
-                Tweet.edition_not_found(mention)
-            except Exception as err:
-                LOGGER.log_error("Failed to handle mention: %s" % err)
-                try:
-                    Tweet.internal_error(mention)
-                except:
-                    LOGGER.log_error("Failed to send internal error tweet: %s" % err)
+                parent_mention = get_parent_tweet_of(mention)
+                isbns = ISBNFinder.find_isbns(parent_mention.full_text)
+            except (twitterbotErrors.GetTweetError, twitterbotErrors.FindISBNError) as e:
+                logging.warning(e)
+                Tweet.internal_error(mention)
                 continue
+            
+            # Reply to me
+            if not isbns and parent_mention.user.id == API.me().id:
+                logging.info(f"IS REPLY TO ME")
+                continue
+        if isbns:
+            for isbn in isbns:
+                try:
+                    handle_isbn(mention, isbn)
+                except twitterbotErrors.SendTweetError as e:
+                    logging.critical(e)
+        else:
+            Tweet.edition_not_found(mention)
 
 
 if __name__ == "__main__":
+
+    # Configure logging
+    logging.basicConfig(filename=LOG_FILE, filemode='a', level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')  
+    
     while True:
         try:
             reply_to_tweets()
+        except Exception as e:
+            logging.critical(f"Failed in main loop: {e}")
+        finally:
             time.sleep(15)
-        except Exception as err:
-            LOGGER.log_error("Failed in main: %s" % err)
